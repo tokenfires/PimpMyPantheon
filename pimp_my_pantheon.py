@@ -19,13 +19,15 @@ import time
 import urllib.request
 import uuid
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 LABEL = "com.tokenfires.pimpmypantheon"
 STATE = Path.home() / "Library/Application Support/PimpMyPantheon"
 CONFIG = STATE / "config.json"
 PLIST = Path.home() / "Library/LaunchAgents" / (LABEL + ".plist")
 LOGS = Path.home() / "Library/Logs/PimpMyPantheon"
 BUNDLE_ID = "com.nousresearch.hermes"
+# `hermes update` copies its rebuilt app over these, so Finder, the Dock and Spotlight launch them.
+INSTALLED_COPIES = ("/Applications/Hermes.app", str(Path.home() / "Applications/Hermes.app"))
 OPERATIONS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG",
               "rebase-merge", "rebase-apply", "sequencer", "index.lock", "HEAD.lock",
               "config.lock", "shallow.lock", "packed-refs.lock")
@@ -177,8 +179,14 @@ class Mac:
     def running(self):
         return json.loads(command(["/usr/bin/osascript", "-l", "JavaScript", "-e", JXA, "list"])[1])
 
+    def owns(self, app):
+        """The configured build, or an installed copy whose backend runs from this checkout."""
+        return app["path"] == self.app or (app["path"] in INSTALLED_COPIES and
+                                           bool(self.backends([app["pid"]])))
+
     def selected(self):
-        return [a for a in self.running() if a["path"] == self.app]
+        # Hermes Desktop holds a single-instance lock, so at most one copy is open.
+        return [a for a in self.running() if self.owns(a)]
 
     def preflight(self):
         app_info(self.app)
@@ -212,7 +220,7 @@ class Mac:
                 raise Deferred("Hermes update marker needs review")
             else:
                 raise Deferred("Another Hermes updater is running")
-        if any(a["path"] != self.app for a in self.running()):
+        if not all(self.owns(a) for a in self.running()):
             raise Deferred("Another Hermes Desktop installation is open")
 
     def validate_cli(self):
@@ -243,19 +251,20 @@ class Mac:
                 break
             descendants |= more
         return [pid for pid, _, argv in rows if pid in descendants and
-                str(self.repo) in argv and "hermes_cli" in argv and " serve " in argv]
+                str(self.repo) + os.sep in argv and "hermes_cli" in argv and " serve " in argv]
 
     def quit(self, apps):
+        paths = {a["path"] for a in apps}
         children = set(self.backends([a["pid"] for a in apps]))
         for app in apps:
             result = json.loads(command(["/usr/bin/osascript", "-l", "JavaScript", "-e", JXA,
-                                         "quit", self.app, str(app["pid"])])[1])
+                                         "quit", app["path"], str(app["pid"])])[1])
             if not result["accepted"]:
                 raise Deferred("Hermes declined the quit request")
         deadline = time.monotonic() + self.config["quit_timeout_seconds"]
         while time.monotonic() < deadline:
             remaining = {pid for pid, _, _ in self.processes()}
-            if not self.selected() and not (children & remaining):
+            if not any(a["path"] in paths for a in self.running()) and not (children & remaining):
                 return
             time.sleep(1)
         raise Deferred("Hermes is still open or busy; update skipped without force-quitting")
@@ -270,14 +279,16 @@ class Mac:
                        timeout=self.config["update_timeout_seconds"], env=self.env,
                        check=False, output=log, pid_callback=pid_callback)[0]
 
-    def reopen(self):
-        app_info(self.app)
-        command(["/usr/bin/open", "-g", "-a", self.app])
+    def reopen(self, path):
+        if path != self.app and path not in INSTALLED_COPIES:
+            raise RuntimeError("Refusing to open an app outside this Hermes installation")
+        app_info(path)
+        command(["/usr/bin/open", "-g", "-a", path])
         deadline = time.monotonic() + self.config["startup_timeout_seconds"]
         # Never send ambient proxy credentials to a local health probe.
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         while time.monotonic() < deadline:
-            apps = self.selected()
+            apps = [a for a in self.running() if a["path"] == path]
             for pid in self.backends([a["pid"] for a in apps]):
                 _, ports = command(["/usr/sbin/lsof", "-nP", "-a", "-p", str(pid),
                                     "-iTCP", "-sTCP:LISTEN", "-Fn"], check=False)
@@ -286,7 +297,7 @@ class Mac:
                         with opener.open("http://127.0.0.1:" + port + "/api/health", timeout=3) as reply:
                             health = json.load(reply)
                         if health.get("ok") is True and health.get("version") == self.identity()["version"]:
-                            return dict(status="ready", pid=apps[0]["pid"], backend_pid=pid,
+                            return dict(status="ready", app=path, pid=apps[0]["pid"], backend_pid=pid,
                                         version=health["version"])
                     except (OSError, ValueError):
                         pass
@@ -347,7 +358,7 @@ def execute(config, state=STATE, scheduled=False, dry_run=False, send_notice=Fal
             # Interrupted runs may have closed the app. Restore it before a new update.
             if pending.get("app") != config["app"]:
                 raise RuntimeError("An interrupted run belongs to a different app; review pending.json")
-            host.reopen()
+            host.reopen(pending.get("reopen", config["app"]))
             (state / "pending.json").unlink()
         previous = read(state / "last-run.json", {})
         if scheduled and previous.get("local_day") == local_day() and previous.get("finished_at"):
@@ -357,7 +368,7 @@ def execute(config, state=STATE, scheduled=False, dry_run=False, send_notice=Fal
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
         report = dict(schema=1, run_id=run_id, started_at=now(), local_day=local_day(),
                       outcome="running", dry_run=dry_run)
-        closed_intent = False
+        reopen_path = None
         log_path = state / "runs" / (run_id + ".log")
         try:
             host.validate_cli()
@@ -370,8 +381,9 @@ def execute(config, state=STATE, scheduled=False, dry_run=False, send_notice=Fal
             else:
                 if apps:
                     # Write intent before quitting so an abrupt interruption is recoverable.
-                    save(state / "pending.json", dict(app=config["app"], run_id=run_id))
-                    closed_intent = True
+                    # Reopen the copy the user was running, which may be an installed copy.
+                    save(state / "pending.json", dict(app=config["app"], reopen=apps[0]["path"], run_id=run_id))
+                    reopen_path = apps[0]["path"]
                     host.quit(apps)
                 host.preflight()
                 report["recovery_ref"] = host.preserve_revision(run_id)
@@ -397,9 +409,9 @@ def execute(config, state=STATE, scheduled=False, dry_run=False, send_notice=Fal
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             report.update(outcome="error", reason=str(error))
         finally:
-            if closed_intent:
+            if reopen_path:
                 try:
-                    report["reopen"] = host.reopen()
+                    report["reopen"] = host.reopen(reopen_path)
                     (state / "pending.json").unlink(missing_ok=True)
                 except Exception:
                     report.update(outcome="error", reason="Hermes could not be verified after reopening; review the local log")

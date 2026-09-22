@@ -21,6 +21,8 @@ class FakeMac:
         self.before = dict(version="1.2.3", sha="a" * 40)
         self.after = dict(version="1.2.4", sha="b" * 40)
         self.running = True
+        self.path = "/Hermes.app"
+        self.reopened = []
         self.changed = False
         self.exit_code = 0
         self.receipt_outcome = "success"
@@ -43,7 +45,7 @@ class FakeMac:
         return self.after if self.changed else self.before
 
     def selected(self):
-        return [dict(pid=44, path="/Hermes.app")] if self.running else []
+        return [dict(pid=44, path=self.path)] if self.running else []
 
     def quit(self, apps):
         self.events.append("quit")
@@ -57,7 +59,7 @@ class FakeMac:
 
     def update(self, log, pid_callback):
         self.events.append("update")
-        self.assert_pending = (self.folder / "state/pending.json").exists()
+        self.pending = p.read(self.folder / "state/pending.json")
         pid_callback(123)
         if self.interrupt:
             raise KeyboardInterrupt
@@ -68,8 +70,9 @@ class FakeMac:
         log.write(b"updater output\n")
         return self.exit_code
 
-    def reopen(self):
+    def reopen(self, path):
         self.events.append("reopen")
+        self.reopened.append(path)
         if self.fail_reopen:
             raise RuntimeError("not healthy")
         self.running = True
@@ -93,9 +96,17 @@ class WorkflowTests(unittest.TestCase):
         result = self.run_job()
         self.assertEqual(result["outcome"], "updated")
         self.assertEqual(self.host.events, ["validate", "preflight", "quit", "preflight", "preserve", "update", "reopen"])
-        self.assertTrue(self.host.assert_pending)
+        self.assertEqual(self.host.pending["reopen"], "/Hermes.app")
+        self.assertEqual(self.host.reopened, ["/Hermes.app"])
         self.assertFalse((self.state / "pending.json").exists())
         self.assertEqual(p.read(self.state / "last-run.json"), result)
+
+    def test_installed_copy_is_updated_and_reopened(self):
+        self.host.path = "/Applications/Hermes.app"
+        self.assertEqual(self.run_job()["outcome"], "updated")
+        self.assertEqual(self.host.pending, dict(app="/Hermes.app", reopen="/Applications/Hermes.app",
+                                                 run_id=self.host.pending["run_id"]))
+        self.assertEqual(self.host.reopened, ["/Applications/Hermes.app"])
 
     def test_already_current_is_truthful(self):
         self.host.after = self.host.before
@@ -140,6 +151,14 @@ class WorkflowTests(unittest.TestCase):
         self.host.events.clear()
         self.assertEqual(self.run_job(scheduled=True)["outcome"], "already_ran_today")
         self.assertEqual(self.host.events, ["reopen"])
+        self.assertEqual(self.host.reopened[-1], "/Hermes.app")
+
+    def test_recovery_reopens_the_copy_that_was_closed(self):
+        self.run_job()
+        p.save(self.state / "pending.json", dict(app="/Hermes.app", reopen="/Applications/Hermes.app"))
+        self.run_job(scheduled=True)
+        self.assertEqual(self.host.reopened[-1], "/Applications/Hermes.app")
+        self.assertFalse((self.state / "pending.json").exists())
 
     def test_no_recovery_in_dry_run(self):
         p.save(self.state / "pending.json", dict(app="/Hermes.app"))
@@ -253,15 +272,7 @@ class NativeBoundaryTests(unittest.TestCase):
     def test_real_git_preflight_dirty_custom_and_recovery_ref(self):
         with tempfile.TemporaryDirectory() as folder:
             repo = Path(folder)
-            def git(*args):
-                return subprocess.run(["git", "-C", folder, *args], check=True, capture_output=True, text=True).stdout.strip()
-            git("init", "-b", "main")
-            git("config", "user.name", "Fixture")
-            git("config", "user.email", "fixture@example.invalid")
-            (repo / "file").write_text("clean")
-            git("add", ".")
-            git("commit", "-m", "fixture")
-            host = p.Mac(dict(checkout=folder, app=str(repo / "apps/desktop/release/mac-arm64/Hermes.app"), path=os.environ["PATH"], hermes_home=folder, git=shutil_which_git()))
+            git, host = git_fixture(folder)
             with patch.object(p, "app_info"), patch.object(host, "running", return_value=[]):
                 host.preflight()
                 ref = host.preserve_revision("fixture")
@@ -275,10 +286,82 @@ class NativeBoundaryTests(unittest.TestCase):
                 with self.assertRaises(p.Deferred):
                     host.preflight()
 
+    def test_real_git_preflight_open_apps(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _, host = git_fixture(folder)
+            copy = dict(pid=50, path="/Applications/Hermes.app")
+            with patch.object(p, "app_info"), patch.object(host, "running", return_value=[copy]):
+                with patch.object(host, "processes", return_value=app_processes(copy, host.repo)):
+                    host.preflight()
+                with patch.object(host, "processes", return_value=app_processes(copy, "/elsewhere/hermes-agent")):
+                    with self.assertRaises(p.Deferred):
+                        host.preflight()
+
+    def test_installed_copy_needs_this_checkouts_backend(self):
+        host = fixture_mac()
+        copy = dict(pid=50, path="/Applications/Hermes.app")
+        elsewhere = dict(pid=50, path="/Users/fixture/Desktop/Hermes.app")
+        with patch.object(host, "running", return_value=[copy]):
+            with patch.object(host, "processes", return_value=app_processes(copy, "/fixture/hermes-agent")):
+                self.assertEqual(host.selected(), [copy])
+            # A sibling checkout whose path shares this one's prefix is another installation.
+            with patch.object(host, "processes", return_value=app_processes(copy, "/fixture/hermes-agent-dev")):
+                self.assertEqual(host.selected(), [])
+        with patch.object(host, "running", return_value=[elsewhere]), \
+                patch.object(host, "processes", return_value=app_processes(elsewhere, "/fixture/hermes-agent")):
+            self.assertEqual(host.selected(), [])
+
+    def test_quit_targets_and_waits_for_the_open_copy(self):
+        host = fixture_mac()
+        copy = dict(pid=50, path="/Applications/Hermes.app")
+        calls = []
+        def fake_command(argv, **kwargs):
+            calls.append(argv)
+            return 0, json.dumps(dict(accepted=True))
+        # Its backend is already gone while the app is still closing.
+        with patch.object(p, "command", fake_command), patch.object(p.time, "sleep"), \
+                patch.object(host, "processes", return_value=[]), \
+                patch.object(host, "running", side_effect=[[copy], []]) as running:
+            host.quit([copy])
+        self.assertEqual(calls[0][-3:], ["quit", "/Applications/Hermes.app", "50"])
+        self.assertEqual(running.call_count, 2)
+
+    def test_reopen_refuses_apps_outside_the_installation(self):
+        host = fixture_mac()
+        with patch.object(p, "command") as command, patch.object(p, "app_info"):
+            with self.assertRaises(RuntimeError):
+                host.reopen("/Users/fixture/Desktop/Hermes.app")
+            command.assert_not_called()
+
 
 def shutil_which_git():
     import shutil
     return shutil.which("git")
+
+
+def git_fixture(folder):
+    def git(*args):
+        return subprocess.run(["git", "-C", folder, *args], check=True, capture_output=True, text=True).stdout.strip()
+    git("init", "-b", "main")
+    git("config", "user.name", "Fixture")
+    git("config", "user.email", "fixture@example.invalid")
+    (Path(folder) / "file").write_text("clean")
+    git("add", ".")
+    git("commit", "-m", "fixture")
+    host = p.Mac(dict(checkout=folder, app=str(Path(folder) / "apps/desktop/release/mac-arm64/Hermes.app"),
+                      path=os.environ["PATH"], hermes_home=folder, git=shutil_which_git()))
+    return git, host
+
+
+def fixture_mac():
+    return p.Mac(dict(checkout="/fixture/hermes-agent", app="/fixture/hermes-agent/apps/desktop/release/mac-arm64/Hermes.app",
+                      path="/bin", hermes_home="/fixture", git="/usr/bin/git", quit_timeout_seconds=5))
+
+
+def app_processes(app, checkout):
+    """ps rows for a desktop app and the backend it started from `checkout`."""
+    return [(app["pid"], 1, app["path"] + "/Contents/MacOS/Hermes"),
+            (app["pid"] + 1, app["pid"], "{}/venv/bin/python -m hermes_cli.main serve --host 127.0.0.1 --port 0".format(checkout))]
 
 
 if __name__ == "__main__":
