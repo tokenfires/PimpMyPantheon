@@ -32,11 +32,11 @@ Repeat on each Mac. Each machine owns its schedule; there is no central controll
 
 ## What happens each day
 
-1. Check the configured Hermes command and installation. Skip modified source files, custom or detached branches, unfinished Git operations, hidden-change index flags, or another active Hermes updater.
-2. If the configured Desktop app is open, request a **normal quit** and wait for it and its owned backend to exit. Hermes's active-work confirmation is respected. If it stays open, skip the update; never click “Quit Anyway” or force-kill the app.
+1. Check the configured Hermes command and installation. Skip modified source files, custom or detached branches, unfinished Git operations, hidden-change index flags, another active Hermes updater, or a Desktop app from a different Hermes installation.
+2. If Hermes Desktop is open, whether from the configured build or the copy Hermes installs in `/Applications`, request a **normal quit** and wait for it and its owned backend to exit. Hermes's active-work confirmation is respected. If it stays open, skip the update; never click “Quit Anyway” or force-kill the app.
 3. Preserve the starting Git revision under `refs/pimp-my-pantheon/pre-update/…`, then run Hermes's own unattended updater. Hermes manages dependencies, configuration migrations, its configured state backups, desktop rebuilding, and gateway restarts.
 4. Require a successful exit and a fresh Hermes receipt belonging to this exact updater process, matching the resulting code revision. Failed or partial update steps are reported as needing attention.
-5. If the app was open, reopen it—even after an update error—and check its local backend's `/api/health` response and version. If it was closed, leave it closed.
+5. If the app was open, reopen the same copy—even after an update error—and check its local backend's `/api/health` response and version. If it was closed, leave it closed.
 6. Show one macOS notification with the result. A version such as `v0.21.1` identifies the release; the short commit ID identifies the particular code revision, since several daily updates can share one version number.
 
 The job makes **one scheduled attempt per local calendar day**, including skipped or failed attempts. Login can catch up after the scheduled time. Logging in before that time waits for the calendar event. Sleep can delay a run until wake; the utility does not wake or power on your Mac. Manual `run` explicitly retries, even on the same day. There is no retry loop or `KeepAlive` job.
@@ -80,7 +80,9 @@ python3 pimp_my_pantheon.py install --at 09:00 \
   --app /absolute/path/to/built/Hermes.app
 ```
 
-The `/Applications/Hermes.app` supplied by Hermes can be a **setup launcher** with a different bundle identifier. Select the built desktop app inside the checkout's `apps/desktop/release/` folder instead. Setup verifies that the command reports the configured installation and that the app has the Hermes Desktop bundle identifier. Multiple candidate builds require an explicit `--app`.
+Configure the built desktop app inside the checkout's `apps/desktop/release/` folder. Setup verifies that the command reports the configured installation and that the app has the Hermes Desktop bundle identifier. Multiple candidate builds require an explicit `--app`.
+
+`/Applications/Hermes.app` can be Hermes's **setup launcher**, which has a different bundle identifier and is ignored. Current Hermes updates also copy the rebuilt app over an existing `/Applications/Hermes.app` or `~/Applications/Hermes.app`, so Finder, the Dock and Spotlight open that copy. PimpMyPantheon treats that copy as part of the configured installation only when its backend runs from the configured checkout. Hermes refreshes the copy while it is closed for the update, and the copy is reopened afterwards. A Hermes Desktop app open from any other location, or backed by another checkout, still skips the day's update.
 
 This utility runs as your normal macOS user. **Do not use sudo.** It uses a per-user LaunchAgent, with a stable Python executable path and an explicit command search path. It does not modify your shell startup files or create an AI automation. It supports one Hermes installation per macOS user. Hermes's updater can refresh gateways across profiles sharing that installation; profile-specific configuration remains under Hermes's control.
 
@@ -115,6 +117,6 @@ One Python file, standard library only. Run:
 python3 -m unittest discover -s tests -v
 ```
 
-Tests cover update/reopen sequencing, failures and interruption, receipt matching, notification behavior, once-per-day scheduling, retention, literal argument handling, process-group cleanup, and real temporary Git repositories. Native Desktop health and notification visibility require a real macOS smoke test. CI runs on macOS with Python 3.9 and 3.14.
+Tests cover update/reopen sequencing, installed-copy ownership, failures and interruption, receipt matching, notification behavior, once-per-day scheduling, retention, literal argument handling, process-group cleanup, and real temporary Git repositories. Native Desktop health and notification visibility require a real macOS smoke test. CI runs on macOS with Python 3.9 and 3.14.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). MIT licensed. Independent community utility; not affiliated with Nous Research.
