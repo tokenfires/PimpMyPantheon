@@ -297,6 +297,68 @@ class NativeBoundaryTests(unittest.TestCase):
                     with self.assertRaises(p.Deferred):
                         host.preflight()
 
+    def test_real_git_preflight_accepts_a_stable_release_checkout(self):
+        # Hermes's default stable channel checks out the exact release commit, so HEAD is detached.
+        with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as tools:
+            git, host = git_fixture(folder)
+            host.config["hermes"] = fake_hermes(tools, folder, STABLE_BANNER)
+            git("tag", "v0.23.1")
+            git("switch", "--detach", "v0.23.1")
+            with patch.object(p, "app_info"), patch.object(host, "running", return_value=[]):
+                host.preflight()
+
+    def test_real_git_preflight_refuses_other_detached_checkouts(self):
+        cases = [
+            ("untagged commit", None, STABLE_BANNER),
+            ("CalVer tag, never a stable release", "v2026.7.20", STABLE_BANNER),
+            ("release tag on a checkout that follows main", "v0.23.1", MAIN_BANNER),
+        ]
+        for name, tag, banner in cases:
+            with self.subTest(name), tempfile.TemporaryDirectory() as folder, \
+                    tempfile.TemporaryDirectory() as tools:
+                git, host = git_fixture(folder)
+                host.config["hermes"] = fake_hermes(tools, folder, banner)
+                if tag:
+                    git("tag", tag)
+                git("switch", "--detach", "HEAD")
+                with patch.object(p, "app_info"), patch.object(host, "running", return_value=[]):
+                    with self.assertRaises(p.Deferred):
+                        host.preflight()
+
+    def test_identity_reads_the_install_stamp(self):
+        # Since 2026-09-23 Hermes keeps its version in install-stamp.json beside the code;
+        # its /api/health reports the same baseVersion.
+        with tempfile.TemporaryDirectory() as folder:
+            git, host = git_fixture(folder)
+            (Path(folder) / "hermes_cli").mkdir()
+            (Path(folder) / "hermes_cli/__init__.py").write_text("__version__: str\n")
+            p.save(Path(folder) / "install-stamp.json", dict(schemaVersion=2, baseVersion="0.23.1"))
+            self.assertEqual(host.identity(), dict(version="0.23.1", sha=git("rev-parse", "HEAD")))
+
+    def test_identity_falls_back_to_the_source_version(self):
+        with tempfile.TemporaryDirectory() as folder:
+            git, host = git_fixture(folder)
+            (Path(folder) / "hermes_cli").mkdir()
+            (Path(folder) / "hermes_cli/__init__.py").write_text('__version__ = "0.12.0"\n')
+            self.assertEqual(host.identity()["version"], "0.12.0")
+            (Path(folder) / "hermes_cli/__init__.py").write_text("__version__: str\n")
+            with self.assertRaises(RuntimeError):
+                host.identity()
+
+    def test_version_report_waits_for_hermes_update_check(self):
+        # `hermes --version` runs Hermes's passive update check, which can be slow on the network.
+        host = fixture_mac()
+        host.config["hermes"] = "/fixture/hermes"
+        timeouts = {}
+        def fake_command(argv, timeout=30, **kwargs):
+            timeouts[argv[-1]] = timeout
+            if argv[-1] == "--help":
+                return 0, "--yes --plan --keep-stash"
+            return 0, STABLE_BANNER + "\nInstall directory: /fixture/hermes-agent\n"
+        with patch.object(p, "command", fake_command):
+            host.validate_cli()
+        self.assertGreaterEqual(timeouts["--version"], 120)
+
     def test_installed_copy_needs_this_checkouts_backend(self):
         host = fixture_mac()
         copy = dict(pid=50, path="/Applications/Hermes.app")
@@ -362,6 +424,20 @@ def app_processes(app, checkout):
     """ps rows for a desktop app and the backend it started from `checkout`."""
     return [(app["pid"], 1, app["path"] + "/Contents/MacOS/Hermes"),
             (app["pid"] + 1, app["pid"], "{}/venv/bin/python -m hermes_cli.main serve --host 127.0.0.1 --port 0".format(checkout))]
+
+
+# The first line of `hermes --version` for a source checkout (hermes_cli/banner.py,
+# format_banner_version_label): a channel other than main is named; main shows its upstream.
+STABLE_BANNER = "Hermes Agent v0.23.1 (2026.9.24) · stable · local 3b4215785882"
+MAIN_BANNER = "Hermes Agent v0.23.1 (2026.9.24) · upstream 3b421578"
+
+
+def fake_hermes(tools, checkout, banner):
+    """A `hermes` command, outside the checkout, that prints a version report."""
+    script = Path(tools) / "hermes"
+    script.write_text("#!/bin/sh\ncat <<'EOF'\n{}\nInstall directory: {}\nEOF\n".format(banner, checkout))
+    script.chmod(0o755)
+    return str(script)
 
 
 if __name__ == "__main__":

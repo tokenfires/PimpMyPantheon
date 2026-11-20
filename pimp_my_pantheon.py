@@ -19,7 +19,7 @@ import time
 import urllib.request
 import uuid
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 LABEL = "com.tokenfires.pimpmypantheon"
 STATE = Path.home() / "Library/Application Support/PimpMyPantheon"
 CONFIG = STATE / "config.json"
@@ -31,6 +31,11 @@ INSTALLED_COPIES = ("/Applications/Hermes.app", str(Path.home() / "Applications/
 OPERATIONS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG",
               "rebase-merge", "rebase-apply", "sequencer", "index.lock", "HEAD.lock",
               "config.lock", "shallow.lock", "packed-refs.lock")
+# Hermes's stable release tag shape, kept in step with STABLE_TAG_RE in hermes_cli/update_channel.py.
+# Capping the major at three digits keeps historical CalVer tags such as v2026.7.20 out.
+STABLE_RELEASE_TAG = re.compile(r"v(?:0|[1-9]\d{0,2})\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)")
+# `hermes --version` also runs Hermes's passive update check, which can outlast the 30 s default.
+VERSION_TIMEOUT_SECONDS = 120
 
 
 def now():
@@ -158,6 +163,11 @@ def app_info(path):
     return info
 
 
+def reports_stable_channel(version_report):
+    """True when `hermes --version` names the stable channel (format_banner_version_label in hermes_cli/banner.py)."""
+    return bool(re.search(r"^Hermes Agent v\S+ \([^)]*\) · stable(?: · local [0-9a-f]+)?$", version_report, re.M))
+
+
 class Mac:
     def __init__(self, config):
         self.config = config
@@ -170,11 +180,20 @@ class Mac:
                        env=self.env)[1].strip()
 
     def identity(self):
+        return dict(version=self.version(), sha=self.git("rev-parse", "HEAD"))
+
+    def version(self):
+        """Hermes's base version, the one its /api/health reports."""
+        # Since 2026-09-23 the install stamp beside the code is Hermes's single version identity.
+        stamp = read(self.repo / "install-stamp.json", {})
+        if isinstance(stamp, dict) and stamp.get("baseVersion"):
+            return stamp["baseVersion"]
+        # Older checkouts declare the version in source.
         text = (self.repo / "hermes_cli/__init__.py").read_text()
         match = re.search(r'^__version__\s*=\s*[\"\']([^\"\']+)', text, re.M)
         if not match:
             raise RuntimeError("Cannot read the Hermes version")
-        return dict(version=match[1], sha=self.git("rev-parse", "HEAD"))
+        return match[1]
 
     def running(self):
         return json.loads(command(["/usr/bin/osascript", "-l", "JavaScript", "-e", JXA, "list"])[1])
@@ -194,7 +213,9 @@ class Mac:
             raise Deferred("The selected app is outside this Hermes checkout's desktop release folder")
         if self.git("rev-parse", "--show-toplevel") != str(self.repo):
             raise Deferred("The configured Hermes checkout is not a repository root")
-        if self.git("branch", "--show-current") != "main":
+        branch = self.git("branch", "--show-current")
+        detached = branch == ""
+        if branch != "main" and not (detached and self.on_stable_release()):
             raise Deferred("Hermes is on a custom or detached branch; review manually")
         if self.git("status", "--porcelain=v1", "--untracked-files=normal", "--ignore-submodules=none"):
             raise Deferred("Hermes source has local changes; review manually")
@@ -223,15 +244,25 @@ class Mac:
         if not all(self.owns(a) for a in self.running()):
             raise Deferred("Another Hermes Desktop installation is open")
 
+    def on_stable_release(self):
+        """Hermes's default stable channel checks out the exact release commit, leaving HEAD detached."""
+        tags = self.git("tag", "--points-at", "HEAD").split()
+        if not any(STABLE_RELEASE_TAG.fullmatch(tag) for tag in tags):
+            return False
+        return reports_stable_channel(self.version_report())
+
     def validate_cli(self):
         help_text = command([self.config["hermes"], "update", "--help"], env=self.env)[1]
         for flag in ("--yes", "--plan", "--keep-stash"):
             if flag not in help_text:
                 raise ValueError("Upgrade Hermes manually first: required update options are missing")
-        version = command([self.config["hermes"], "--version"], env=self.env)[1]
+        version = self.version_report()
         match = re.search(r"^Install directory:\s*(.+)$", version, re.M)
         if not match or Path(match[1].strip()).resolve() != self.repo:
             raise ValueError("The Hermes command does not report the configured installation")
+
+    def version_report(self):
+        return command([self.config["hermes"], "--version"], timeout=VERSION_TIMEOUT_SECONDS, env=self.env)[1]
 
     def processes(self):
         rows = command(["/bin/ps", "-axo", "pid=,ppid=,args="])[1]

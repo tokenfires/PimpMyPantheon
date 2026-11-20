@@ -32,7 +32,7 @@ Repeat on each Mac. Each machine owns its schedule; there is no central controll
 
 ## What happens each day
 
-1. Check the configured Hermes command and installation. Skip modified source files, custom or detached branches, unfinished Git operations, hidden-change index flags, another active Hermes updater, or a Desktop app from a different Hermes installation.
+1. Check the configured Hermes command and installation. Skip modified source files, custom branches, a detached checkout that isn't a Hermes stable release, unfinished Git operations, hidden-change index flags, another active Hermes updater, or a Desktop app from a different Hermes installation.
 2. If Hermes Desktop is open, whether from the configured build or the copy Hermes installs in `/Applications`, request a **normal quit** and wait for it and its owned backend to exit. Hermes's active-work confirmation is respected. If it stays open, skip the update; never click “Quit Anyway” or force-kill the app.
 3. Preserve the starting Git revision under `refs/pimp-my-pantheon/pre-update/…`, then run Hermes's own unattended updater. Hermes manages dependencies, configuration migrations, its configured state backups, desktop rebuilding, and gateway restarts.
 4. Require a successful exit and a fresh Hermes receipt belonging to this exact updater process, matching the resulting code revision. Failed or partial update steps are reported as needing attention.
@@ -96,6 +96,12 @@ This utility runs as your normal macOS user. **Do not use sudo.** It uses a per-
 | Hermes's own update receipts | `<hermes-home>/logs/update_receipts/` |
 
 Logs and configuration are private local files. **Do not publish them:** Hermes's own output can include machine paths, profile names, or sensitive diagnostics. The normal success notification contains only the version and commit ID.
+
+## Hermes channels and versions
+
+Official Hermes checkouts follow the **stable** channel by default: `hermes update` checks out the exact commit of the latest `vX.Y.Z` release, so Git shows a detached HEAD. That is Hermes working as designed, and PimpMyPantheon updates it when HEAD sits exactly on a stable release tag and `hermes --version` names the stable channel. A checkout on `main` (`hermes update --set-channel main`) is updated too. Any other branch or detached commit is left for you to review.
+
+PimpMyPantheon reads the Hermes version from the `install-stamp.json` that Hermes keeps beside its code (since September 2026), the same version its `/api/health` endpoint reports. Older checkouts fall back to `hermes_cli/__init__.py`. `hermes --version` also runs Hermes's own update check, so the utility allows it two minutes.
 
 ## Limits and recovery
 
